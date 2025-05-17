@@ -1,6 +1,6 @@
-# Combina lado incorrecto y MULTIDIGIT para clasificación de POIs
 import pandas as pd
 import geopandas as gpd
+import matplotlib.pyplot as plt
 from shapely.geometry import Point, LineString, MultiLineString
 from shapely.ops import linemerge
 import glob
@@ -23,6 +23,8 @@ gdf_links = gpd.GeoDataFrame(pd.concat(
     crs="EPSG:4326"
 )
 gdf_links["link_id"] = gdf_links["link_id"].astype(str)
+
+# 🔍 Filtrar calles MULTIDIGIT
 multidig_links = gdf_links[gdf_links["MULTIDIGIT"] == "Y"]
 
 # ----------------------
@@ -35,19 +37,24 @@ df_pois = df_pois[df_pois["PERCFRREF"].notna() & df_pois["POI_ST_SD"].isin(["L",
 df_pois["PERCFRREF"] = pd.to_numeric(df_pois["PERCFRREF"], errors='coerce')
 
 # ----------------------
-# Unir con geometría
+# Unir con geometrías de calles
 # ----------------------
 merged = df_pois.merge(gdf_links[["link_id", "geometry"]], left_on="LINK_ID", right_on="link_id")
-merged["link_geometry"] = merged["geometry"]
+merged["link_geometry"] = merged["geometry"]  # 🔒 Guardar copia antes de modificarla
 
 # ----------------------
-# Calcular punto interpolado
+# Calcular geometría de cada POI
 # ----------------------
 def get_point_along_link(row):
     geom = row["link_geometry"]
     if geom.geom_type == "MultiLineString":
         merged_geom = linemerge(geom)
-        line = merged_geom if isinstance(merged_geom, LineString) else list(merged_geom.geoms)[0]
+        if isinstance(merged_geom, LineString):
+            line = merged_geom
+        elif isinstance(merged_geom, MultiLineString):
+            line = list(merged_geom.geoms)[0]
+        else:
+            return None
     elif isinstance(geom, LineString):
         line = geom
     else:
@@ -55,13 +62,31 @@ def get_point_along_link(row):
 
     perc = min(max(row["PERCFRREF"], 0), 1)
     point = line.interpolate(perc, normalized=True)
-    return point
+
+    try:
+        if row["POI_ST_SD"] == "R":
+            offset = line.parallel_offset(0.0001, 'right', join_style=2)
+        elif row["POI_ST_SD"] == "L":
+            offset = line.parallel_offset(0.0001, 'left', join_style=2)
+        else:
+            return point
+
+        if offset.is_empty:
+            return point
+        elif isinstance(offset, LineString):
+            return offset.interpolate(offset.length * perc)
+        elif isinstance(offset, MultiLineString):
+            return list(offset.geoms)[0].interpolate(list(offset.geoms)[0].length * perc)
+        else:
+            return point
+    except Exception:
+        return point
 
 merged["geometry"] = merged.apply(get_point_along_link, axis=1)
 gdf_pois = gpd.GeoDataFrame(merged, geometry="geometry", crs="EPSG:4326")
 
 # ----------------------
-# Verificar lado correcto
+# Verificar si el POI está del lado correcto del link
 # ----------------------
 def verificar_lado_correcto(row):
     geom = row["geometry"]
@@ -69,7 +94,12 @@ def verificar_lado_correcto(row):
 
     if line.geom_type == "MultiLineString":
         merged = linemerge(line)
-        line = merged if isinstance(merged, LineString) else list(merged.geoms)[0]
+        if isinstance(merged, LineString):
+            line = merged
+        elif isinstance(merged, MultiLineString):
+            line = list(merged.geoms)[0]
+        else:
+            return "indeterminado"
 
     start, end = list(line.coords)[0], list(line.coords)[-1]
     v_link = (end[0] - start[0], end[1] - start[1])
@@ -79,36 +109,29 @@ def verificar_lado_correcto(row):
     lado_real = "L" if cross > 0 else ("R" if cross < 0 else "Eje")
     return "correcto" if lado_real == row["POI_ST_SD"] else "lado_incorrecto"
 
+# Detectar violaciones por lado incorrecto
 gdf_pois["lado_valido"] = gdf_pois.apply(verificar_lado_correcto, axis=1)
 
 # ----------------------
-# Detectar MULTIDIGIT conflictivo
+# Diagnóstico
 # ----------------------
-def en_buffer_multidig(row):
-    link_geom = gdf_links[gdf_links["link_id"] == row["LINK_ID"]].geometry.values[0]
-    buffer = link_geom.buffer(0.00015, cap_style=2)
-    return buffer.contains(row.geometry)
-
-gdf_pois["posible_violacion_multidig"] = gdf_pois["LINK_ID"].isin(multidig_links["link_id"]) & gdf_pois.apply(en_buffer_multidig, axis=1)
+print("POIs correctos:", len(gdf_pois[gdf_pois["lado_valido"] == "correcto"]))
+print("POIs incorrectos:", len(gdf_pois[gdf_pois["lado_valido"] == "lado_incorrecto"]))
+print("Geometrías vacías:", gdf_pois.geometry.is_empty.sum())
+print("Geometrías nulas:", gdf_pois.geometry.isna().sum())
 
 # ----------------------
-# Clasificación combinada
+# Visualización condicional
 # ----------------------
-def clasificar(row):
-    if row["lado_valido"] == "lado_incorrecto" and row["posible_violacion_multidig"]:
-        return "error_combinado"
-    elif row["lado_valido"] == "lado_incorrecto":
-        return "lado_incorrecto"
-    elif row["posible_violacion_multidig"]:
-        return "solo_multidig"
-    else:
-        return "sin_error"
-
-gdf_pois["clasificacion"] = gdf_pois.apply(clasificar, axis=1)
-
-# ----------------------
-# Exportar resultados
-# ----------------------
-out_path = "output/pois_clasificados.geojson"
-gdf_pois.to_file(out_path, driver="GeoJSON")
-print(f"Archivo exportado: {out_path}")
+if len(gdf_pois[gdf_pois["lado_valido"] == "correcto"]) > 0:
+    fig, ax = plt.subplots(figsize=(12, 12))
+    gdf_links.plot(ax=ax, color="lightgray", linewidth=0.5)
+    gdf_pois[gdf_pois["lado_valido"] == "correcto"].plot(ax=ax, color="green", markersize=6, label="POIs correctos")
+    gdf_pois[gdf_pois["lado_valido"] == "lado_incorrecto"].plot(ax=ax, color="blue", markersize=8, label="Lado incorrecto")
+    plt.legend()
+    plt.title("Verificación de lado de POIs respecto al Link")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.show()
+else:
+    print("❗ Todos los POIs están marcados como incorrectos. Revisa la lógica del lado.")
